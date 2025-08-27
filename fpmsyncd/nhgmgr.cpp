@@ -1,9 +1,11 @@
 #include "nhgmgr.h"
+#include <string.h>
+#include "logger.h"
 
-NHGMgr::getInstance()
+using namespace std;
+
+NHGMgr::NHGMgr()
 {
-    static NHGMgr instance;
-    return &instance;
 }
 
 NHGMgr::~NHGMgr()
@@ -13,56 +15,57 @@ NHGMgr::~NHGMgr()
 int NHGMgr::addNHG(const NextHopGroupFull nhg)
 {
     int ret = 0;
-    string key = NexthopKey::getKeyFromNextHopGroupFull(nhg);
-    if (m_rib_nhg_table.isNhgExist(key))
+    if (m_rib_nhg_table.isNhgExist(nhg.id))
     {
-        RIBNhgEntry *entry = m_rib_nhg_table->getEntry(key);
-        m_rib_nhg_table.update(entry)
+        RIBNhgEntry *entry = m_rib_nhg_table.getEntry(nhg.id);
+        m_rib_nhg_table.updateNhg(nhg.id, nhg);
     }
     else
     {
-        RIBNhgEntry *new_entry = new RIBNhgEntry(nhg);
-        ret = m_rib_nhg_table.insert(new_entry)
+        ret = m_rib_nhg_table.addNhg(nhg);
     }
-    // srv6 sonic nhg create
+    // TODO: srv6 sonic nhg create
     return ret;
 }
 
 int NHGMgr::delNHG(uint32_t id)
 {
-    if (!m_rib_nhg_table.isNhgExist(key))
+    if (!m_rib_nhg_table.isNhgExist(id))
     {
-        SWSS_LOG_ERROR("NextHop group id %d not found. Dropping the route %s", nhg_id, destipprefix);
+        SWSS_LOG_ERROR("NextHop group id %d not found.", id);
         return 0;
     }
 
-    // del nhg from sonic table
+    // TODO: del nhg from sonic table
     return m_rib_nhg_table.delNhg(id);
 }
 
-RIBNhgEntry *NHGMgr::getRIBNhgEntryByKey(std::string key)
+RIBNhgEntry *NHGMgr::getRIBNhgEntryByKey(string key)
 {
-    return m_rib_nhg_table->getEntry(key);
+    return m_rib_nhg_table.getEntry(key);
 }
 
 RIBNhgEntry *NHGMgr::getRIBNhgEntryByRIBID(uint32_t id)
 {
-    return m_rib_nhg_table->getEntry(id);
+    return m_rib_nhg_table.getEntry(id);
 }
 
 // TODO: add sonic boject creationuint32_t
-
-SonicNHGObject *NHGMgr::getSonicNhgByRIBID(string key)
+SonicNHGObject *NHGMgr::getSonicNHGByKey(std::string key)
 {
     return nullptr;
 }
 
-SonicNHGObject *getSonicNhgByKey(string key)
+SonicNHGObject *NHGMgr::getSonicNHGByRIBID(uint32_t id)
 {
     return nullptr;
 }
 
-RIBNhgEntry *RIBNhgTable::getEntry(std::string key)
+RIBNhgTable::RIBNhgTable()
+{
+}
+
+RIBNhgEntry *RIBNhgTable::getEntry(string key)
 {
     auto it = m_key_2_id_map.find(key);
     if (it == m_key_2_id_map.end())
@@ -91,16 +94,18 @@ int RIBNhgTable::delNhg(uint32_t id)
 {
     if (m_nhg_map.find(id) == m_nhg_map.end())
     {
-        SWSS_LOG_ERROR("NextHop group id %d not found.", nhg_id);
+        SWSS_LOG_ERROR("NextHop group id %d not found.", id);
         return 0;
     }
 
-    RIBEntry *entry = m_nhg_map[id];
+    RIBNhgEntry *entry = m_nhg_map[id];
     if (entry->getDependentsID().size() != 0)
     {
-        SWSS_LOG_ERROR("NextHop group id %d still has dependents.", nhg_id);
+        SWSS_LOG_ERROR("NextHop group id %d still has dependents.", id);
         return -1;
     }
+
+    // TODO: update depends and dependents
 
     m_key_2_id_map.erase(entry->getKey());
     delete entry;
@@ -110,53 +115,72 @@ int RIBNhgTable::delNhg(uint32_t id)
 
 int RIBNhgTable::addNhg(NextHopGroupFull nhg)
 {
-    if (nhg == nullptr)
-    {
-        SWSS_LOG_ERROR("nhg is null");
-        return -1;
-    }
-    if (m_nhg_map
-            .find(nhg->getId()) != m_nhg_map.end())
+    if (m_nhg_map.find(nhg->getId()) != m_nhg_map.end())
     {
         SWSS_LOG_ERROR("NextHop group id %d key %s already exists.", nhg->id);
         return -1;
     }
 
-    RIBEntry *entry = RIBEntry::create_nhg_entry(nhg);
+    RIBNhgEntry *entry = RIBNhgEntry::create_nhg_entry(nhg);
     if (entry == nullptr)
     {
         SWSS_LOG_ERROR("Failed to create nhg entry for %s", nhg->getKey());
         return -1;
     }
 
-    update_nhg_dependents(entry)
+    // TODO: update depends and dependents
 
-        m_nhg_map.insert(std::make_pair(nhg->getId(), entry));
+    m_nhg_map.insert(std::make_pair(nhg->getId(), entry));
+    m_key_2_id_map.insert(std::make_pair(entry->getKey(), entry));
+    return 0;
+}
+
+int RIBNhgTable::updateNhg(NextHopGroupFull nhg)
+{
+    if (m_nhg_map.find(nhg.getId()) == m_nhg_map.end())
+    {
+        SWSS_LOG_ERROR("NextHop group id %d key %s not exists.", nhg.id);
+        return -1;
+    }
+
+    RIBNhgEntry *entry = m_nhg_map.find(nhg->getId())->second();
+
+    int ret = entry->setEntry(nhg);
+    if (ret != 0)
+    {
+        SWSS_LOG_ERROR("Failed to create nhg entry for %s", nhg->getKey());
+        return -1;
+    }
+
+    // TODO: update depends and dependents
+
+    m_nhg_map.insert(std::make_pair(nhg.id, entry));
     m_key_2_id_map.insert(std::make_pair(entry->getKey(), entry));
     return 0;
 }
 
 void RIBNhgTable::add_nhg_dependents(RIBNhgEntry *entry)
 {
-    for (int i = 0; i < entry->nhg.group.size(); i++)
+    for (int i = 0; i < entry->getNhg().group.size(); i++)
     {
-        m_nhg_map[entry->nhg.group[i].first]->m_depends.push_back(entry->nhg.getId());
+        m_nhg_map[entry->getNhg().group[i].first]->m_depends.push_back(entry->getNhg().getId());
     }
 }
 
 void RIBNhgTable::remove_nhg_dependents(RIBNhgEntry *entry)
 {
-    for (int i = 0; i < entry->nhg.group.size(); i++)
+    for (int i = 0; i < entry->getNhg().group.size(); i++)
     {
-        m_nhg_map[entry->nhg.group[i].first]->m_depends.push_back(entry->nhg.getId());
+        m_nhg_map[entry->getNhg().group[i].first]->m_depends.push_back(entry->getNhg().id);
     }
 }
 
-RIBNhgEntry *RIBNhgEntry::create_nhg_entry(const NextHopGroupFull nhg)
+RIBNhgEntry *RIBNhgEntry::create_nhg_entry(NextHopGroupFull nhg)
 {
 
     RIBNhgEntry *entry = new RIBNhgEntry();
-    int ret = entry->setEntry(nhg) if ret != 0
+    int ret = entry->setEntry(nhg);
+    if (ret != 0)
     {
         delete entry;
         return nullptr;
@@ -174,7 +198,7 @@ vector<pair<uint32_t, uint8_t>> RIBNhgEntry::getResolvedGroup()
     return m_resolved_group;
 }
 
-vector<RIBNhgEntry *> RIBNhgEntry::~getDependsID()
+vector<RIBNhgEntry *> RIBNhgEntry::getDependsID()
 {
     return m_depends;
 }
@@ -184,9 +208,19 @@ vector<RIBNhgEntry *> RIBNhgEntry::getDependentsID()
     return m_dependents;
 }
 
-int setEntry(NexthopGroupFull)
+NexthopKey RIBNhgEntry::getKey()
 {
-    entry->key = NexthopKey(&nhg) for (int i = 0; i < nhg.group.size(); i++)
+    return m_key;
+}
+
+NextHopGroupFull RIBNhgEntry::getNhg()
+{
+    return m_nhg;
+}
+int RIBNhgEntry::setEntry(NexthopGroupFull)
+{
+    m_key = NexthopKey(&nhg);
+    for (int i = 0; i < nhg.group.size(); i++)
     {
 
         // validate group member
@@ -197,9 +231,7 @@ int setEntry(NexthopGroupFull)
         }
 
         // update resolved group
-        if (nhg
-                .group[i]
-                .type != nexthop_types_t::NEXTHOP_TYPE_RECURSIVED)
+        if (nhg.group[i].type != NEXTHOP_TYPE_RECURSIVED)
         {
             entry->resolved_group.push_back(nhg.group[i]);
         }
@@ -209,9 +241,64 @@ int setEntry(NexthopGroupFull)
     return 0;
 }
 
-SonicNHGTable::SonicNHGTable(DBConnector &db)
+NexthopKey::NexthopKey(const NextHopGroupFull *nhg)
 {
-    m_db = db;
+    key = "";
+    for (int i = 0; i < nhg->group.size(); i++)
+    {
+        if (i == 0)
+        {
+            key = key + "group:";
+        }
+        key = key + "id" + nhg->group[i].id + "weight" + nhg->group[i].weight;
+    }
+    switch (nhg->type)
+    {
+    case NEXTHOP_TYPE_IFINDEX:
+    {
+        key = key + "type:" + nhg->type;
+        key = key + "ifindex:" + nhg->ifindex;
+        key = key + "vrf_id" + nhg->vrf_id;
+    }
+    case NEXTHOP_TYPE_IPV4:
+    {
+        key = key + "type:" + nhg->type;
+        key = key + "ifindex:" + nhg->ifindex;
+        key = key + "vrf_id" + nhg->vrf_id;
+        key = key + "gate" + nhg->gate.ipv4;
+    }
+    case NEXTHOP_TYPE_IPV4_IFINDEX:
+    {
+        key = key + "type:" + nhg->type;
+        key = key + "ifindex:" + nhg->ifindex;
+        key = key + "vrf_id" + nhg->vrf_id;
+        key = key + "gate" + nhg->gate.ipv4;
+    }
+    case NEXTHOP_TYPE_IPV6:
+    {
+        key = key + "type:" + nhg->type;
+        key = key + "ifindex:" + nhg->ifindex;
+        key = key + "vrf_id" + nhg->vrf_id;
+        key = key + "gate" + nhg->gate.ipv6;
+    }
+    case NEXTHOP_TYPE_IPV6_IFINDEX:
+    {
+        key = key + "type:" + nhg->type;
+        key = key + "ifindex:" + nhg->ifindex;
+        key = key + "vrf_id" + nhg->vrf_id;
+        key = key + "gate" + nhg->gate.ipv6;
+    }
+    case NEXTHOP_TYPE_BLACKHOLE:
+    {
+        key = key + "type:" + nhg->type;
+        key = key + "blackhole_type:" + nhg->bh_type;
+    }
+    default:
+    }
+}
+
+SonicNHGTable::SonicNHGTable()
+{
 }
 
 SonicNHGTable::~SonicNHGTable()
@@ -253,4 +340,3 @@ void SonicNHGEntry::create_nhg_entry()
 {
     return;
 }
-
