@@ -4,12 +4,16 @@
 
 using namespace std;
 
-NHGMgr::NHGMgr()
-{
-}
 
+NHGMgr::NHGMgr(RedisPipeline *pipeline) :m_rib_nhg_table(pipeline, APP_NEXTHOP_GROUP_TABLE_NAME, true),
+{
+    m_rib_nhg_table = new RIBNhgTable(pipeline)
+}
 NHGMgr::~NHGMgr()
 {
+    if (m_rib_nhg_table != nullptr){
+        delete m_rib_nhg_table;
+    }
 }
 
 int NHGMgr::addNHG(const NextHopGroupFull nhg)
@@ -40,6 +44,30 @@ int NHGMgr::delNHG(uint32_t id)
     return m_rib_nhg_table.delNhg(id);
 }
 
+bool NHGMgr::getIfName(int if_index, char *if_name, size_t name_len)
+{
+    if (!if_name || name_len == 0)
+    {
+        return false;
+    }
+
+    memset(if_name, 0, name_len);
+
+    /* Cannot get interface name. Possibly the interface gets re-created. */
+    if (!rtnl_link_i2name(m_link_cache, if_index, if_name, name_len))
+    {
+        /* Trying to refill cache */
+        nl_cache_refill(m_nl_sock, m_link_cache);
+        if (!rtnl_link_i2name(m_link_cache, if_index, if_name, name_len))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
 RIBNhgEntry *NHGMgr::getRIBNhgEntryByKey(string key)
 {
     return m_rib_nhg_table.getEntry(key);
@@ -50,17 +78,19 @@ RIBNhgEntry *NHGMgr::getRIBNhgEntryByRIBID(uint32_t id)
     return m_rib_nhg_table.getEntry(id);
 }
 
-// TODO: add sonic boject creationuint32_t
+// TODO: add sonic object creation
 SonicNHGObject *NHGMgr::getSonicNHGByKey(std::string key)
 {
     return nullptr;
 }
 
-SonicNHGObject *NHGMgr::getSonicNHGByRIBID(uint32_t id)
+SonicNHGObject *NHGMgr::getSonicNHGByID(uint32_t id)
 {
     return nullptr;
 }
-
+void NHGMgr::dump_zebra_nhg_table(string &ret) {
+    m_rib_nhg_table->dump_table(ret);
+}
 RIBNhgTable::RIBNhgTable()
 {
 }
@@ -121,10 +151,14 @@ int RIBNhgTable::addNhg(NextHopGroupFull nhg)
         return -1;
     }
 
-    RIBNhgEntry *entry = RIBNhgEntry::create_nhg_entry(nhg);
+    RIBNhgEntry *entry = RIBNhgEntry::create_nhg_entry(nhg, this);
     if (entry == nullptr)
     {
         SWSS_LOG_ERROR("Failed to create nhg entry for %s", nhg->getKey());
+        return -1;
+    }
+    if( writeToDB(nhg->getId)!=0){
+        SWSS_LOG_ERROR("Failed to write to DB for %s", nhg->getKey());
         return -1;
     }
 
@@ -152,6 +186,12 @@ int RIBNhgTable::updateNhg(NextHopGroupFull nhg)
         return -1;
     }
 
+    ret = writeToDB(nhg->getId());
+    if (ret < 0){
+        SWSS_LOG_ERROR("Failed to write to DB for %s", nhg->getKey());
+        return -1;
+    }
+
     // TODO: update depends and dependents
 
     m_nhg_map.insert(std::make_pair(nhg.id, entry));
@@ -175,10 +215,113 @@ void RIBNhgTable::remove_nhg_dependents(RIBNhgEntry *entry)
     }
 }
 
-RIBNhgEntry *RIBNhgEntry::create_nhg_entry(NextHopGroupFull nhg)
+bool RIBNhgTable::isNhgExist(string key)
+{
+    auto it = m_key_2_id_map.find(key);
+    if (it != m_key_2_id_map.end())
+    {
+        return true;
+    }
+    return false;
+}
+
+bool RIBNhgTable::isNhgExist(uint32_t id)
+{
+    auto it = m_nhg_map.find(key);
+    if (it != m_nhg_map.end())
+    {
+        return true;
+    }
+    return false;
+}
+int RIBNhgTable::writeToDB(uint32_t id) {
+
+    auto it = m_nhg_map.find(id);
+    if (it == m_nhg_map.end())
+    {
+        SWSS_LOG_ERROR("NextHop group id %d not found.", id);
+        return -1;
+    }
+    if (it->second->getGroup().size() == 0){
+        SWSS_DEBUG("NextHop group id %d has single path", id);
+        return 0;
+    }
+    vector<FieldValueTuple> fvVector = it->second->getFvVector();
+    if (fvVector.size() == 0)
+    {
+        if(it->second->syncFvVector()!=0)
+        {
+            SWSS_LOG_ERROR("Failed to sync fvVector for %s", it->second->getKey());
+            return -1;
+        }
+    }
+
+    return m_nexthop_groupTable.set(it->second->getNhg().id, it->second->getFvVector());
+
+}
+RIBNhgTable::RIBNhgTable(RedisPipeline *pipeline, string table_name, bool is_state_table): m_nexthop_groupTable(pipeline, table_name, is_state_table) {
+
+}
+RIBNhgTable::~RIBNhgTable() {
+}
+void RIBNhgTable::dump_table(string &ret) {
+string indent = "    ";
+    for (auto it = m_nhg_map.begin(); it != m_nhg_map.end(); it++)
+    {
+        NextHopGroupFull nhg = it->second->getNhg();
+        ret += "nhg id: " + to_string(nhg.id) + ":\n";
+        if (it->second->isInstalled())
+        {
+            ret += indent + "installed\n";
+        }
+        else
+        {
+            ret += indent + "not installed\n";
+        }
+        if (it->second->getGroup().size() != 0){
+            ret += indent + "group: ";
+            for (auto it2 = it->second->getGroup().begin(); it2 != it->second->getGroup().end(); it2++)
+            {
+                ret += to_string(it2->first) + ":" + to_string(it2->second) + ",";
+            }
+        }
+
+        if (!it->second->getNexthop().empty())
+        {
+            ret += indent + "nexthop: " + it->second->getNexthop() + "\n";
+        }
+
+        switch (nhg.type)
+        {
+            case NEXTHOP_TYPE_IFINDEX:
+                ret += indent + "type: " + "NEXTHOP_TYPE_IFINDEX" + "\n";
+                ret += indent + "interface: " + it->nhg->ifname + "\n";
+                break ;
+            case NEXTHOP_TYPE_IPV4:
+                ret += indent + "type: " + "NEXTHOP_TYPE_IPV4" + "\n";
+                break;
+            case NEXTHOP_TYPE_IPV4_IFINDEX:
+                ret += indent + "type: " + "NEXTHOP_TYPE_IPV4_IFINDEX" + "\n";
+                ret += indent + "interface: " + it->nhg->ifname + "\n";
+                break;
+            case NEXTHOP_TYPE_IPV6_IFINDEX:
+                ret += indent + "type: " + "NEXTHOP_TYPE_IPV6_IFINDEX" + "\n";
+                ret += indent + "interface: " + it->nhg->ifname + "\n";
+                break;
+            case NEXTHOP_TYPE_IPV6:
+                ret += indent + "type: " + "NEXTHOP_TYPE_IPV6" + "\n";
+                break;
+            default:
+                SWSS_LOG_ERROR("Unknown NextHop type %d", nhg.type);
+                return -1;
+        }
+    }
+}
+
+RIBNhgEntry *RIBNhgEntry::create_nhg_entry(NextHopGroupFull nhg, RIBNhgTable* table)
 {
 
-    RIBNhgEntry *entry = new RIBNhgEntry();
+    RIBNhgEntry *entry = new RIBNhgEntry(table);
     int ret = entry->setEntry(nhg);
     if (ret != 0)
     {
@@ -217,9 +360,11 @@ NextHopGroupFull RIBNhgEntry::getNhg()
 {
     return m_nhg;
 }
-int RIBNhgEntry::setEntry(NexthopGroupFull)
+
+int RIBNhgEntry::setEntry(NexthopGroupFull nhg)
 {
     m_key = NexthopKey(&nhg);
+    m_nhg = nhg;
     for (int i = 0; i < nhg.group.size(); i++)
     {
 
@@ -238,7 +383,128 @@ int RIBNhgEntry::setEntry(NexthopGroupFull)
 
         // TODO: add dependent and depends
     }
+    switchswitch (nhg.type)
+    {
+        case NEXTHOP_TYPE_IFINDEX:
+            m_nexthop = "";
+            break;
+        case NEXTHOP_TYPE_IPV4:
+            char gate_str[INET_ADDRSTRLEN];
+            m_af = AF_INET;
+            inet_ntop(AF_INET, &nhg->gate.ipv4, gate_str, INET_ADDRSTRLEN);
+            m_nexthop = string(gate_str);
+            break;
+        case NEXTHOP_TYPE_IPV4_IFINDEX:
+            char gate_str[INET_ADDRSTRLEN];
+            m_af=AF_INET;
+            inet_ntop(AF_INET, &nhg->gate.ipv4, gate_str, INET_ADDRSTRLEN);
+            m_nexthop = string(gate_str);
+            break;
+        case NEXTHOP_TYPE_IPV6_IFINDEX:
+            char gate_str[INET6_ADDRSTRLEN];
+            m_af=AF_INET6;
+            m_nexthop = inet_ntop(AF_INET6, &nhg->gate.ipv6, gate_str, INET6_ADDRSTRLEN);
+            m_nexthop = string(gate_str);
+            break;
+        case NEXTHOP_TYPE_IPV6:
+            char gate_str[INET6_ADDRSTRLEN];
+            m_af=AF_INET6;
+            inet_ntop(AF_INET6, &nhg->gate.ipv6, gate_str, INET6_ADDRSTRLEN);
+            m_nexthop = string(gate_str);
+            break;
+        default:
+            SWSS_LOG_ERROR("Unknown NextHop type %d", nhg.type);
+            return -1;
+    }
+
     return 0;
+}
+
+vector<FieldValueTuple> RIBNhgEntry::getFvVector() {
+    return m_fvVector;
+}
+
+int RIBNhgEntry::syncFvVector() {
+    string nexthops;
+    string ifnames;
+    string weights;
+    // TODO: sonic id manager allocate the key
+    string key = to_string(m_nhg.id);
+    ifnames = m_nhg.ifname;
+    vector<FieldValueTuple> fvVector;
+    int ret = getNextHopGroupFields(nexthops, ifnames, weights, m_nhg.af);
+    if (ret <0) {
+        SWSS_LOG_ERROR("Failed to get field of %d", nhg.id);
+    }
+
+    FieldValueTuple nh("nexthop", nexthops.c_str());
+    FieldValueTuple ifname("ifname", ifnames.c_str());
+    fvVector.push_back(nh);
+    fvVector.push_back(ifname);
+    if(!weights.empty())
+    {
+        FieldValueTuple wg("weight", weights.c_str());
+        fvVector.push_back(wg);
+    }
+    SWSS_LOG_INFO("NextHopGroup table set: key [%s] nexthop[%s] ifname[%s] weight[%s]", key.c_str(), nexthops.c_str(), ifnames.c_str(), weights.c_str());
+
+    m_nexthop_groupTable.set(key.c_str(), fvVector);
+    return 0;
+}
+
+int RIBNhgEntry::getNextHopGroupFields( string& nexthops, string& ifnames, string& weights, uint8_t af)
+{
+    if(m_nhg.group.size() == 0)
+    {
+        if(!m_nexthop.empty())
+        {
+            nexthops = m_nexthop;
+        }
+        else
+        {
+            nexthops = af == AF_INET ? "0.0.0.0" : "::";
+        }
+        ifnames = nhg.intf;
+    }
+    else
+    {
+        int i = 0;
+        for(const auto& nh : m_nhg.group)
+        {
+            uint32_t id = nh.id;
+            if(!m_table->isNhgExist(id))
+            {
+                SWSS_LOG_ERROR("NextHop group is incomplete: %d", nhg.id);
+                return -1;
+            }
+
+            string weight = to_string(nh.weight);
+            if(i)
+            {
+                nexthops += NHG_DELIMITER;
+                ifnames += NHG_DELIMITER;
+                weights += NHG_DELIMITER;
+            }
+            nexthops += nh.m_nexthop.empty() ? (af == AF_INET ? "0.0.0.0" : "::") : nh.nexthop;
+            ifnames += nh.m_nhg.intf;
+            weights += weight;
+            ++i;
+        }
+    }
+}
+
+RIBNhgEntry::RIBNhgEntry() {
+}
+bool RIBNhgEntry::isInstalled() {
+    return m_installed;
+}
+void RIBNhgEntry::setInstalled(bool installed) {
+    m_installed = installed;
+}
+RIBNhgEntry::RIBNhgEntry(RIBNhgTable *table):m_table(table) {
+}
+string RIBNhgEntry::getNexthop() {
+    return m_nexthop;
 }
 
 NexthopKey::NexthopKey(const NextHopGroupFull *nhg)
@@ -259,6 +525,7 @@ NexthopKey::NexthopKey(const NextHopGroupFull *nhg)
         key = key + "type:" + nhg->type;
         key = key + "ifindex:" + nhg->ifindex;
         key = key + "vrf_id" + nhg->vrf_id;
+        break ;
     }
     case NEXTHOP_TYPE_IPV4:
     {
@@ -266,6 +533,8 @@ NexthopKey::NexthopKey(const NextHopGroupFull *nhg)
         key = key + "ifindex:" + nhg->ifindex;
         key = key + "vrf_id" + nhg->vrf_id;
         key = key + "gate" + nhg->gate.ipv4;
+        break ;
+
     }
     case NEXTHOP_TYPE_IPV4_IFINDEX:
     {
@@ -273,6 +542,8 @@ NexthopKey::NexthopKey(const NextHopGroupFull *nhg)
         key = key + "ifindex:" + nhg->ifindex;
         key = key + "vrf_id" + nhg->vrf_id;
         key = key + "gate" + nhg->gate.ipv4;
+        break ;
+
     }
     case NEXTHOP_TYPE_IPV6:
     {
@@ -280,6 +551,8 @@ NexthopKey::NexthopKey(const NextHopGroupFull *nhg)
         key = key + "ifindex:" + nhg->ifindex;
         key = key + "vrf_id" + nhg->vrf_id;
         key = key + "gate" + nhg->gate.ipv6;
+        break ;
+
     }
     case NEXTHOP_TYPE_IPV6_IFINDEX:
     {
@@ -287,11 +560,14 @@ NexthopKey::NexthopKey(const NextHopGroupFull *nhg)
         key = key + "ifindex:" + nhg->ifindex;
         key = key + "vrf_id" + nhg->vrf_id;
         key = key + "gate" + nhg->gate.ipv6;
+        break ;
+
     }
     case NEXTHOP_TYPE_BLACKHOLE:
     {
         key = key + "type:" + nhg->type;
         key = key + "blackhole_type:" + nhg->bh_type;
+        break ;
     }
     default:
     }
