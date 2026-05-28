@@ -453,14 +453,12 @@ using namespace std;
          * get the full group of RIBNHGEntry
          * contain <ribID, weight> pair
          */
-        unordered_map<uint32_t, uint8_t> getGroup();
         unordered_map<uint32_t, uint16_t> getGroup() { return m_group; }
 
         /*
          * get the resolved group of RIBNHGEntry
          * contain <ribID, weight> pair
          */
-        unordered_map<uint32_t, uint8_t> getResolvedGroup() { return m_resolvedGroup; }
         unordered_map<uint32_t, uint16_t> getResolvedGroup() { return m_resolvedGroup; }
 
         /*
